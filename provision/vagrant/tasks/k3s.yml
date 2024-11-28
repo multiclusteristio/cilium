@@ -1,0 +1,76 @@
+- name: Set variables
+  set_fact:
+    cluster_config_file: "/etc/rancher/k3s/config.yaml"  # K3s config file path
+    kubeconfig_remote_path: "/etc/rancher/k3s/k3s.yaml"  # Kubeconfig location on VM
+    kubeconfig_local_path: "output/{{ inventory_hostname }}-kubeconfig.yml"  # Local path for kubeconfig
+
+- name: Check if K3s cluster is initialized
+  stat:
+    path: "{{ kubeconfig_remote_path }}"
+  register: k3s_cluster_check
+
+- name: Ensure K3s configuration directory exists
+  file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: '0755'
+  when: k3s_cluster_check.stat.exists == false
+
+- name: Create K3s configuration file with specific IP ranges and cluster name
+  copy:
+    dest: "{{ cluster_config_file }}"
+    content: |
+      write-kubeconfig-mode: "644"
+      cluster-cidr: "{{ pod_cidr }}"  # Pod CIDR
+      service-cidr: "{{ service_cidr }}"  # Service CIDR
+      bind-address: "{{ k3s_api_host_ip }}"  # API server bind address
+      advertise-address: "{{ k3s_api_host_ip }}"  # API server advertise address
+      cluster-name: "{{ inventory_hostname }}"  # Dynamically set cluster name
+  when: k3s_cluster_check.stat.exists == false
+
+- name: Install K3s with systemd service
+  shell: |
+    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--flannel-backend=none --disable-network-policy' sh -
+    systemctl enable k3s
+    systemctl start k3s
+  args:
+    executable: /bin/bash
+  when: k3s_cluster_check.stat.exists == false
+
+- name: Wait for K3s cluster initialization
+  wait_for:
+    path: "{{ kubeconfig_remote_path }}"
+    state: present
+    timeout: 60
+  when: k3s_cluster_check.stat.exists == false
+
+- name: Verify K3s cluster is running
+  command: kubectl get nodes --kubeconfig="{{ kubeconfig_remote_path }}"
+  register: k3s_cluster_verify
+  failed_when: k3s_cluster_verify.rc != 0
+  
+
+- name: Retrieve K3s kubeconfig from VM
+  fetch:
+    src: "{{ kubeconfig_remote_path }}"
+    dest: "{{ kubeconfig_local_path }}"
+    flat: yes
+
+- name: Update kubeconfig to use VM's private IP address
+  lineinfile:
+    path: "{{ kubeconfig_local_path }}"
+    regexp: 'server: https://127.0.0.1:6443'
+    line: "server: https://{{ k3s_api_host_ip }}:6443"
+
+- name: Ensure .kube directory exists on guest machine
+  file:
+    path: "/root/.kube"
+    state: directory
+    mode: '0755'
+
+- name: Copy Kubeconfig to .kube folder on guest machine
+  copy:
+    src: "{{ kubeconfig_remote_path }}"
+    dest: "/root/.kube/config"
+    remote_src: yes
+
